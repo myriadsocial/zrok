@@ -11,6 +11,7 @@ import (
 	"github.com/openziti/zrok/rest_server_zrok/operations/environment"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"time"
 )
 
 type enableHandler struct{}
@@ -20,6 +21,8 @@ func newEnableHandler() *enableHandler {
 }
 
 func (h *enableHandler) Handle(params environment.EnableParams, principal *rest_model_zrok.Principal) middleware.Responder {
+	start := time.Now()
+
 	// start transaction early; if it fails, don't bother creating ziti resources
 	trx, err := str.Begin()
 	if err != nil {
@@ -27,42 +30,56 @@ func (h *enableHandler) Handle(params environment.EnableParams, principal *rest_
 		return environment.NewEnableInternalServerError()
 	}
 	defer func() { _ = trx.Rollback() }()
+	finishTrx := time.Since(start)
 
+	startLimits := time.Now()
 	if err := h.checkLimits(principal, trx); err != nil {
 		logrus.Errorf("limits error for user '%v': %v", principal.Email, err)
 		return environment.NewEnableUnauthorized()
 	}
+	finishLimits := time.Since(startLimits)
 
+	startClient := time.Now()
 	client, err := zrokEdgeSdk.Client(cfg.Ziti)
 	if err != nil {
 		logrus.Errorf("error getting edge client for user '%v': %v", principal.Email, err)
 		return environment.NewEnableInternalServerError()
 	}
+	finishClient := time.Since(startClient)
 
+	startToken := time.Now()
 	uniqueToken, err := createShareToken()
 	if err != nil {
 		logrus.Errorf("error creating unique identity token for user '%v': %v", principal.Email, err)
 		return environment.NewEnableInternalServerError()
 	}
+	finishToken := time.Since(startToken)
 
+	startIdentity := time.Now()
 	ident, err := zrokEdgeSdk.CreateEnvironmentIdentity(uniqueToken, principal.Email, params.Body.Description, client)
 	if err != nil {
 		logrus.Errorf("error creating environment identity for user '%v': %v", principal.Email, err)
 		return environment.NewEnableInternalServerError()
 	}
+	finishIdentity := time.Since(startIdentity)
 
+	startEnroll := time.Now()
 	envZId := ident.Payload.Data.ID
 	cfg, err := zrokEdgeSdk.EnrollIdentity(envZId, client)
 	if err != nil {
 		logrus.Errorf("error enrolling environment identity for user '%v': %v", principal.Email, err)
 		return environment.NewEnableInternalServerError()
 	}
+	finishEnroll := time.Since(startEnroll)
 
+	startERP := time.Now()
 	if err := zrokEdgeSdk.CreateEdgeRouterPolicy(envZId, envZId, client); err != nil {
 		logrus.Errorf("error creating edge router policy for user '%v': %v", principal.Email, err)
 		return environment.NewEnableInternalServerError()
 	}
+	finishERP := time.Since(startERP)
 
+	startStore := time.Now()
 	envId, err := str.CreateEnvironment(int(principal.ID), &store.Environment{
 		Description: params.Body.Description,
 		Host:        params.Body.Host,
@@ -74,7 +91,9 @@ func (h *enableHandler) Handle(params environment.EnableParams, principal *rest_
 		_ = trx.Rollback()
 		return environment.NewEnableInternalServerError()
 	}
+	finishStore := time.Since(startStore)
 
+	startCommit := time.Now()
 	if err := trx.Commit(); err != nil {
 		logrus.Errorf("error committing for user '%v': %v", principal.Email, err)
 		return environment.NewEnableInternalServerError()
@@ -93,6 +112,12 @@ func (h *enableHandler) Handle(params environment.EnableParams, principal *rest_
 		panic(err)
 	}
 	resp.Payload.Cfg = out.String()
+
+	finishCommit := time.Since(startCommit)
+	finish := time.Since(start)
+
+	logrus.Infof("finishTrx = %v, finishLimits = %v, finishClient = %v, finishToken = %v, finishIdentity = %v, finishEnroll = %v, finishERP = %v, finishStore = %v, finishCommit = %v, finish = %v",
+		finishTrx, finishLimits, finishClient, finishToken, finishIdentity, finishEnroll, finishERP, finishStore, finishCommit, finish)
 
 	return resp
 }
